@@ -1,12 +1,10 @@
 import re
 import json
-import time
 import ast
 import os
 import requests
 import torch
 import numpy as np
-from difflib import SequenceMatcher
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from sentence_transformers import SentenceTransformer
 import gradio as gr
@@ -28,189 +26,125 @@ def load_data():
 
 def save_data(data):
     with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+        json.dump(data, f)
 
 dataset = load_data()
 
 # =========================
-# EMBEDDINGS
+# EMBEDDINGS (LIGHT)
 # =========================
 embed_model = SentenceTransformer("all-MiniLM-L6-v2")
-embeddings = []
+embeddings = [embed_model.encode(d["input"]) for d in dataset]
 
-def build_embeddings():
-    global embeddings
-    embeddings = [embed_model.encode(item["input"]) for item in dataset]
-
-def search_embedding(query):
+def search_memory(q):
     if not embeddings:
         return None
 
-    q = embed_model.encode(query)
-
+    qv = embed_model.encode(q)
     scores = [
-        np.dot(q, e) / (np.linalg.norm(q) * np.linalg.norm(e))
+        np.dot(qv, e) / (np.linalg.norm(qv) * np.linalg.norm(e))
         for e in embeddings
     ]
 
-    idx = int(np.argmax(scores))
-    if scores[idx] > 0.75:
-        return dataset[idx]["output"]
-
-    return None
-
-build_embeddings()
+    i = int(np.argmax(scores))
+    if scores[i] > 0.75:
+        return dataset[i]["output"]
 
 # =========================
-# SEARCH ENGINES
+# SEARCH (FAST)
 # =========================
-def wiki_search(q):
-    try:
-        url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{q.replace(' ','_')}"
-        r = requests.get(url)
-        if r.status_code == 200:
-            return r.json().get("extract")
-    except:
-        pass
-
 def google_search(q):
     if not SERPER_API_KEY:
         return None
+
     try:
-        res = requests.post(
+        r = requests.post(
             "https://google.serper.dev/search",
             headers={
                 "X-API-KEY": SERPER_API_KEY,
                 "Content-Type": "application/json"
             },
-            json={"q": q}
+            json={"q": q},
+            timeout=5
         ).json()
 
-        if "answerBox" in res:
-            return res["answerBox"].get("snippet")
+        if "answerBox" in r:
+            return r["answerBox"].get("snippet")
 
-        if "organic" in res:
-            return res["organic"][0].get("snippet")
+        if "organic" in r:
+            return r["organic"][0].get("snippet")
+
     except:
         pass
-
-def duck_search(q):
-    try:
-        r = requests.get(f"https://api.duckduckgo.com/?q={q}&format=json").json()
-        return r.get("AbstractText")
-    except:
-        pass
-
-def backup_search(q):
-    try:
-        html = requests.get(
-            f"https://duckduckgo.com/html/?q={q}",
-            headers={"User-Agent": "Mozilla/5.0"}
-        ).text
-
-        m = re.findall(r'class="result__a".*?>(.*?)</a>', html)
-        if m:
-            clean = re.sub("<.*?>", "", m[0])
-            if len(clean) > 20:
-                return clean
-    except:
-        pass
-
-def smart_search(q):
-    for fn in [wiki_search, google_search, duck_search, backup_search]:
-        res = fn(q)
-        if res:
-            return res
-    return None
 
 # =========================
-# MATH
+# SAFE MATH
 # =========================
-def solve_math(text):
+def solve_math(t):
     try:
-        text = text.replace("x", "*").replace(" ", "")
-        return str(eval(text))
+        t = t.replace("x", "*").replace(" ", "")
+        return str(eval(compile(ast.parse(t, mode="eval"), "", "eval")))
     except:
         return None
 
 # =========================
-# MODEL (FIXED)
+# MODEL (FAST LOAD)
 # =========================
-model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+model_name = "distilgpt2"  # 🔥 MUCH FASTER for Render
 
 tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoModelForCausalLM.from_pretrained(model_name)
 
-model = AutoModelForCausalLM.from_pretrained(
-    model_name,
-    torch_dtype=torch.float32   # SAFE for CPU
-)
-
-tokenizer.pad_token = tokenizer.eos_token
-
-def generate(prompt):
-    inputs = tokenizer(prompt, return_tensors="pt")
+def generate(p):
+    inp = tokenizer(p, return_tensors="pt")
 
     with torch.no_grad():
         out = model.generate(
-            **inputs,
-            max_new_tokens=60,
-            do_sample=False
+            **inp,
+            max_new_tokens=40,
+            do_sample=True,
+            temperature=0.7
         )
 
-    return tokenizer.decode(out[0], skip_special_tokens=True).split("Assistant:")[-1].strip()
+    return tokenizer.decode(out[0], skip_special_tokens=True)
 
 # =========================
 # CHAT
 # =========================
-def chat(user_input, history):
-    text = user_input.strip()
-    lower = text.lower()
+def chat(msg, history):
+    text = msg.strip()
+    low = text.lower()
 
-    # greeting
-    if lower in ["hi","hello","hey"]:
+    if low in ["hi","hello","hey"]:
         yield "Hey! 😄 What can I help you with?"
         return
 
-    # math
-    m = solve_math(lower)
+    m = solve_math(low)
     if m:
         yield f"{m} (Math ✅)"
         return
 
-    # embeddings memory
-    mem = search_embedding(lower)
+    mem = search_memory(low)
     if mem:
         yield mem
         return
 
-    # web search
-    res = smart_search(lower)
-    if res:
-        if len(res) < 300:
-            dataset.append({"input": lower, "output": res})
-            if len(dataset) > 1000:
-                dataset.pop(0)
-            save_data(dataset)
-            build_embeddings()
-
-        yield res
+    web = google_search(low)
+    if web:
+        yield web
         return
 
-    # coding mode
-    if any(k in lower for k in ["code","python","html","js"]):
-        yield generate(f"Write clean code:\n{text}")
-        return
-
-    # fallback
     yield generate(f"User: {text}\nAssistant:")
 
 # =========================
-# UI
+# UI (IMPORTANT)
 # =========================
+port = int(os.environ.get("PORT", 10000))
+
 demo = gr.ChatInterface(
     fn=chat,
-    title="⚡ Smart AI Ultra",
-    description="Search + Memory + Math + Code"
+    title="⚡ Smart AI (Render)",
+    description="Fast • Search • Memory • Math"
 )
 
-demo.launch(server_name="0.0.0.0", server_port=7860)
+demo.launch(server_name="0.0.0.0", server_port=port)
